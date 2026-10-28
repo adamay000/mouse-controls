@@ -285,7 +285,13 @@ static class Program
 
     static void LoadConfig()
     {
-        if (!File.Exists(ConfigPath))
+        // config.txt がなければ config.example.txt をコピーし、それもなければ既定の内容で作る
+        string examplePath = Path.Combine(Path.GetDirectoryName(ConfigPath), "config.example.txt");
+        if (!File.Exists(ConfigPath) && File.Exists(examplePath))
+        {
+            File.Copy(examplePath, ConfigPath);
+        }
+        else if (!File.Exists(ConfigPath))
         {
             File.WriteAllText(ConfigPath,
                 "# 書式: プロセス名  サイドボタン1(戻る)  サイドボタン2(進む)\r\n" +
