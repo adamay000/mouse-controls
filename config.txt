@@ -1,0 +1,6 @@
+﻿# 書式: プロセス名  サイドボタン1(戻る)  サイドボタン2(進む)
+# キー名: Shift / Ctrl / Alt / Esc / Enter / Tab / A / F5 など（.NET の Keys 名）
+# "-" はデフォルト動作のまま。ここに書いていないアプリもデフォルト動作。
+# 編集後はトレイアイコンの右クリック→「設定を再読み込み」
+chrome  Esc  Shift
+parsecd  Esc  Shift
