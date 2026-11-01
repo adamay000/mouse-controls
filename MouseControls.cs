@@ -3,10 +3,13 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
@@ -43,6 +46,26 @@ static class Program
     [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
     [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string name);
+
+    // 前面ウィンドウの切り替え通知
+    delegate void WinEventProc(IntPtr hook, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time);
+    [DllImport("user32.dll")] static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr hmod, WinEventProc proc, uint pid, uint tid, uint flags);
+    [DllImport("user32.dll")] static extern bool UnhookWinEvent(IntPtr hook);
+    const uint EVENT_SYSTEM_FOREGROUND = 3;
+    static WinEventProc foregroundProc = OnForegroundChanged; // GCで消えないよう保持
+
+    // プロセスの権限（管理者かどうか）を調べる
+    [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("advapi32.dll")] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll")] static extern bool GetTokenInformation(IntPtr token, int cls, out int value, int len, out int retLen);
+    const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+    const uint TOKEN_QUERY = 0x8;
+    const int TokenElevation = 20;
+
+    static readonly bool IsSelfElevated =
+        new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator);
+    const string TaskName = "MouseControls";
 
     static HookProc hookProc = HookCallback; // GCで消えないよう保持
     static HookProc keyHookProc = KeyHookCallback;
@@ -94,16 +117,22 @@ static class Program
     }
 
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
         bool created;
-        using (new Mutex(true, "MouseControls_SingleInstance", out created))
+        using (var mutex = new Mutex(true, "MouseControls_SingleInstance", out created))
         {
+            // 「管理者として再起動」で起動されたときは、前のインスタンスが終わるのを待つ
+            if (!created && Array.IndexOf(args, "--restart") >= 0)
+            {
+                try { created = mutex.WaitOne(10000); }
+                catch (AbandonedMutexException) { created = true; }
+            }
             if (!created) return;
 
             SetProcessDPIAware(); // 高DPIでもアイコンやメニューがぼやけないように
             StartLogWriter();
-            Log("起動: " + Application.ExecutablePath);
+            Log("起動: " + Application.ExecutablePath + "  権限: " + (IsSelfElevated ? "管理者" : "通常"));
             LoadConfig();
 
             var startup = new ToolStripMenuItem("Windows起動時に実行") { Checked = IsStartupEnabled() };
@@ -119,6 +148,8 @@ static class Program
             menu.Items.Add("設定を再読み込み", null, delegate { LoadConfig(); });
             menu.Items.Add("ログを開く", null, delegate { Process.Start("notepad.exe", "\"" + LogPath + "\""); });
             menu.Items.Add(startup);
+            if (!IsSelfElevated)
+                menu.Items.Add("管理者として再起動", null, delegate { RestartAsAdmin(); });
             menu.Items.Add("終了", null, delegate { Application.Exit(); });
 
             Icon icon;
@@ -130,8 +161,10 @@ static class Program
             Log("マウスフック: " + (hookHandle != IntPtr.Zero ? "OK" : "失敗 error=" + Marshal.GetLastWin32Error()));
             keyHookHandle = SetWindowsHookEx(WH_KEYBOARD_LL, keyHookProc, GetModuleHandle(null), 0);
             Log("キーボードフック: " + (keyHookHandle != IntPtr.Zero ? "OK" : "失敗 error=" + Marshal.GetLastWin32Error()));
+            IntPtr fgHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, foregroundProc, 0, 0, 0);
             Application.Run();
 
+            UnhookWinEvent(fgHook);
             UnhookWindowsHookEx(hookHandle);
             UnhookWindowsHookEx(keyHookHandle);
             tray.Visible = false;
@@ -400,17 +433,95 @@ static class Program
         return Enum.TryParse(s, true, out key) && key != Keys.None && (int)key <= 0xFF;
     }
 
+    // 前面のアプリが変わるたびに、名前と権限をログに出す
+    static void OnForegroundChanged(IntPtr hook, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
+    {
+        uint pid;
+        GetWindowThreadProcessId(hwnd, out pid);
+        string name;
+        try { using (var p = Process.GetProcessById((int)pid)) name = p.ProcessName.ToLowerInvariant(); }
+        catch { name = "?"; }
+        bool elevated = IsProcessElevated(pid);
+        Log("前面のアプリ: " + name + (elevated ? " (管理者)" : "") +
+            (elevated && !IsSelfElevated ? " ← このアプリが通常権限のため、ここではマウス入力を受け取れません" : ""));
+    }
+
+    static bool IsProcessElevated(uint pid)
+    {
+        IntPtr process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if (process == IntPtr.Zero) return false;
+        try
+        {
+            IntPtr token;
+            if (!OpenProcessToken(process, TOKEN_QUERY, out token)) return false;
+            try { int value, len; return GetTokenInformation(token, TokenElevation, out value, 4, out len) && value != 0; }
+            finally { CloseHandle(token); }
+        }
+        finally { CloseHandle(process); }
+    }
+
+    static void RestartAsAdmin()
+    {
+        try { Process.Start(new ProcessStartInfo(Application.ExecutablePath, "--restart") { Verb = "runas", UseShellExecute = true }); }
+        catch (Win32Exception) { return; } // UAC でキャンセルされた
+        Application.Exit();
+    }
+
+    // 自動起動はタスクスケジューラで「最高の特権」で登録する（管理者権限のアプリでも効くように）。
+    // レジストリの Run は管理者権限で起動できないため使わない
     static bool IsStartupEnabled()
     {
-        using (var k = Registry.CurrentUser.OpenSubKey(RunKey)) return k != null && k.GetValue(AppName) != null;
+        var psi = new ProcessStartInfo("schtasks.exe", "/Query /TN " + TaskName)
+        { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+        using (var p = Process.Start(psi)) { p.WaitForExit(); return p.ExitCode == 0; }
     }
 
     static void SetStartup(bool enable)
     {
-        using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
+        string xmlPath = Path.Combine(Path.GetTempPath(), "MouseControls_task.xml");
+        string args = "/Delete /TN " + TaskName + " /F";
+        if (enable)
         {
-            if (enable) k.SetValue(AppName, "\"" + Application.ExecutablePath + "\"");
-            else k.DeleteValue(AppName, false);
+            File.WriteAllText(xmlPath, TaskXml(), Encoding.Unicode);
+            args = "/Create /TN " + TaskName + " /XML \"" + xmlPath + "\" /F";
         }
+        try
+        {
+            var psi = new ProcessStartInfo("schtasks.exe", args) { Verb = "runas", UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden };
+            using (var p = Process.Start(psi))
+            {
+                p.WaitForExit();
+                Log("自動起動の" + (enable ? "登録" : "解除") + ": schtasks 終了コード " + p.ExitCode);
+            }
+        }
+        catch (Win32Exception) { Log("自動起動の変更をキャンセル"); }
+        finally { if (File.Exists(xmlPath)) File.Delete(xmlPath); }
+
+        // 以前のレジストリ方式の登録が残っていれば消す（通常権限で二重に起動してしまうため）
+        using (var k = Registry.CurrentUser.OpenSubKey(RunKey, true))
+            if (k != null) k.DeleteValue(AppName, false);
+    }
+
+    // ログオン時に最高の特権で起動。電源や実行時間の制限は外し、優先度は通常(4)にする
+    static string TaskXml()
+    {
+        string user = SecurityElement.Escape(WindowsIdentity.GetCurrent().Name);
+        string exe = SecurityElement.Escape(Application.ExecutablePath);
+        string dir = SecurityElement.Escape(Path.GetDirectoryName(Application.ExecutablePath));
+        return
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n" +
+            "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n" +
+            "  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + user + "</UserId></LogonTrigger></Triggers>\r\n" +
+            "  <Principals><Principal id=\"Author\"><UserId>" + user + "</UserId><LogonType>InteractiveToken</LogonType>" +
+            "<RunLevel>HighestAvailable</RunLevel></Principal></Principals>\r\n" +
+            "  <Settings>\r\n" +
+            "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n" +
+            "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n" +
+            "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n" +
+            "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n" +
+            "    <Priority>4</Priority>\r\n" +
+            "  </Settings>\r\n" +
+            "  <Actions Context=\"Author\"><Exec><Command>" + exe + "</Command><WorkingDirectory>" + dir + "</WorkingDirectory></Exec></Actions>\r\n" +
+            "</Task>\r\n";
     }
 }
