@@ -1,5 +1,5 @@
 // マウスのサイドボタンを、前面アプリごとに別のキーへ割り当てる常駐アプリ。
-// 設定は exe と同じフォルダの config.txt。
+// 設定は exe と同じフォルダの appsettings.json。
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -9,6 +9,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -89,7 +90,7 @@ static class Program
 
     static string ConfigPath
     {
-        get { return Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "config.txt"); }
+        get { return Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "appsettings.json"); }
     }
 
     [STAThread]
@@ -255,12 +256,20 @@ static class Program
         }
     }
 
-    // 設定ファイルに「プロセス名 - -」の行を足し、キーを書いてもらうためにメモ帳で開く
+    // 設定ファイルに両ボタン "Default" のアプリを足し、キーを書いてもらうためにメモ帳で開く
     static void AddApp(string name)
     {
-        string text = File.ReadAllText(ConfigPath, Encoding.UTF8);
-        if (text.Length > 0 && !text.EndsWith("\n")) text += "\r\n";
-        File.WriteAllText(ConfigPath, text + name + "  -  -\r\n", Encoding.UTF8);
+        try
+        {
+            var apps = ReadConfigFile();
+            apps[name] = new[] { "Default", "Default" };
+            WriteConfigFile(apps);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("設定ファイルを読み込めないため追加できませんでした:\n" + ex.Message, AppName);
+            return;
+        }
         Log("アプリを追加: " + name);
         LoadConfig();
         Process.Start("notepad.exe", "\"" + ConfigPath + "\"");
@@ -283,55 +292,105 @@ static class Program
         catch { return ""; }
     }
 
+    const string ConfigHeader =
+        "// サイドボタンの割り当て（XButton1 = 戻る / XButton2 = 進む）\r\n" +
+        "// アプリ名はプロセス名（.exe は省略可）。ここにないアプリは通常の動作のまま\r\n" +
+        "// キー名: Shift / Ctrl / Alt / Esc / Enter / Tab / A / F5 など（.NET の Keys 名）。\"Default\" は通常の動作\r\n" +
+        "// 編集後はトレイアイコンの右クリック→「設定を再読み込み」\r\n";
+
+    // "Apps" を { アプリ名: [XButton1, XButton2] } の形で読む。// で始まる行はコメントとして無視する
+    static Dictionary<string, string[]> ReadConfigFile()
+    {
+        var json = new StringBuilder();
+        foreach (var line in File.ReadAllLines(ConfigPath, Encoding.UTF8))
+            if (!line.TrimStart().StartsWith("//")) json.AppendLine(line);
+
+        var root = new JavaScriptSerializer().DeserializeObject(json.ToString()) as Dictionary<string, object>;
+        object appsObj;
+        if (root == null || !root.TryGetValue("Apps", out appsObj) || !(appsObj is Dictionary<string, object>))
+            throw new FormatException("\"Apps\": { ... } が見つかりません");
+
+        var result = new Dictionary<string, string[]>();
+        foreach (var pair in (Dictionary<string, object>)appsObj)
+        {
+            var obj = pair.Value as Dictionary<string, object>;
+            if (obj == null) throw new FormatException("\"" + pair.Key + "\" の値が { ... } になっていません");
+            var buttons = new Dictionary<string, object>(obj, StringComparer.OrdinalIgnoreCase);
+            result[pair.Key] = new[] { GetString(buttons, "XButton1"), GetString(buttons, "XButton2") };
+        }
+        return result;
+    }
+
+    static string GetString(Dictionary<string, object> d, string key)
+    {
+        object v;
+        return d.TryGetValue(key, out v) && v != null ? v.ToString() : "Default";
+    }
+
+    static void WriteConfigFile(Dictionary<string, string[]> apps)
+    {
+        var js = new JavaScriptSerializer();
+        var sb = new StringBuilder(ConfigHeader);
+        sb.Append("{\r\n  \"Apps\": {\r\n");
+        int i = 0;
+        foreach (var pair in apps)
+        {
+            sb.Append("    " + js.Serialize(pair.Key) + ": { \"XButton1\": " + js.Serialize(pair.Value[0]) +
+                ", \"XButton2\": " + js.Serialize(pair.Value[1]) + " }");
+            sb.Append(++i < apps.Count ? ",\r\n" : "\r\n");
+        }
+        sb.Append("  }\r\n}\r\n");
+        File.WriteAllText(ConfigPath, sb.ToString(), Encoding.UTF8);
+    }
+
     static void LoadConfig()
     {
-        // config.txt がなければ config.example.txt をコピーし、それもなければ既定の内容で作る
-        string examplePath = Path.Combine(Path.GetDirectoryName(ConfigPath), "config.example.txt");
+        // appsettings.json がなければ appsettings.example.json をコピーし、それもなければ既定の内容で作る
+        string examplePath = Path.Combine(Path.GetDirectoryName(ConfigPath), "appsettings.example.json");
         if (!File.Exists(ConfigPath) && File.Exists(examplePath))
-        {
             File.Copy(examplePath, ConfigPath);
-        }
         else if (!File.Exists(ConfigPath))
+            WriteConfigFile(new Dictionary<string, string[]> { { "chrome", new[] { "Esc", "Shift" } } });
+
+        Dictionary<string, string[]> apps;
+        try { apps = ReadConfigFile(); }
+        catch (Exception ex)
         {
-            File.WriteAllText(ConfigPath,
-                "# 書式: プロセス名  サイドボタン1(戻る)  サイドボタン2(進む)\r\n" +
-                "# キー名: Shift / Ctrl / Alt / Esc / Enter / Tab / A / F5 など（.NET の Keys 名）\r\n" +
-                "# \"-\" はデフォルト動作のまま。ここに書いていないアプリもデフォルト動作。\r\n" +
-                "# 編集後はトレイアイコンの右クリック→「設定を再読み込み」\r\n" +
-                "chrome  Esc  Shift\r\n", Encoding.UTF8);
+            Log("設定の読み込みに失敗: " + ex.Message);
+            MessageBox.Show("設定ファイルを読み込めませんでした（前の設定のまま動きます）:\n" + ex.Message, AppName);
+            return;
         }
 
         var result = new Dictionary<string, Keys[]>();
         var errors = new List<string>();
-        foreach (var raw in File.ReadAllLines(ConfigPath, Encoding.UTF8))
+        foreach (var pair in apps)
         {
-            string line = raw.Trim();
-            if (line.Length == 0 || line.StartsWith("#")) continue;
-            string[] parts = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length != 3) { errors.Add(line); continue; }
-
-            string name = parts[0].ToLowerInvariant();
+            string name = pair.Key.ToLowerInvariant();
             if (name.EndsWith(".exe")) name = name.Substring(0, name.Length - 4);
             Keys k1, k2;
-            if (!ParseKey(parts[1], out k1) || !ParseKey(parts[2], out k2)) { errors.Add(line); continue; }
+            if (!ParseKey(pair.Value[0], out k1) || !ParseKey(pair.Value[1], out k2))
+            {
+                errors.Add(pair.Key + ": XButton1=" + pair.Value[0] + ", XButton2=" + pair.Value[1]);
+                continue;
+            }
             result[name] = new[] { k1, k2 };
         }
         mappings = result;
 
         Log("設定読み込み: " + ConfigPath);
         foreach (var pair in result)
-            Log("  " + pair.Key + "  ボタン1=" + pair.Value[0] + "  ボタン2=" + pair.Value[1]);
-        foreach (var e in errors) Log("  読み込めなかった行: " + e);
+            Log("  " + pair.Key + "  XButton1=" + pair.Value[0] + "  XButton2=" + pair.Value[1]);
+        foreach (var e in errors) Log("  キー名が不正: " + e);
 
         if (errors.Count > 0)
-            MessageBox.Show("読み込めなかった行:\n" + string.Join("\n", errors), AppName);
+            MessageBox.Show("キー名が不正なアプリ:\n" + string.Join("\n", errors), AppName);
     }
 
     static bool ParseKey(string s, out Keys key)
     {
-        switch (s.ToLowerInvariant())
+        switch (s.Trim().ToLowerInvariant())
         {
-            case "-": key = Keys.None; return true;
+            case "default": case "-": case "": key = Keys.None; return true;
             case "shift": key = Keys.LShiftKey; return true;
             case "ctrl": case "control": key = Keys.LControlKey; return true;
             case "alt": key = Keys.LMenu; return true;

@@ -1,8 +1,8 @@
 # ビルド成果物
 *.exe
 
-# 個人の設定（雛形は config.example.txt）
-config.txt
+# 個人の設定（雛形は appsettings.example.json）
+appsettings.json
 
 # 実行時に生成されるログ
 log.txt
